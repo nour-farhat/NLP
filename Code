@@ -1,0 +1,582 @@
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from collections import Counter
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import f1_score
+import re
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+from nltk.tokenize import word_tokenize
+
+
+# Device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+import pandas as pd
+import os
+
+# First check what files are actually available
+for dirname, _, filenames in os.walk('/kaggle/input'):
+    for filename in filenames:
+        print(os.path.join(dirname, filename))
+
+# Then use the exact path shown in the output
+train = pd.read_csv('/content/train_kaggle.csv')
+test = pd.read_csv('/content/test_kaggle.csv')
+
+import nltk
+nltk.download('punkt')
+nltk.download('stopwords')
+nltk.download('wordnet')
+nltk.download('omw-1.4')
+nltk.download('punkt_tab')
+
+# Load data
+train = pd.read_csv('/content/train_kaggle.csv')
+test = pd.read_csv('/content/test_kaggle.csv')
+
+# -------------------------
+# Visualization: Label Distribution
+# -------------------------
+plt.figure(figsize=(10, 6))
+label_counts = train['label'].value_counts().sort_index()
+ax = label_counts.plot(kind='bar')
+plt.title('Label Distribution in Training Set', fontsize=14)
+plt.xlabel('Label', fontsize=12)
+plt.ylabel('Count', fontsize=12)
+
+# Add value labels on top of bars
+for p in ax.patches:
+    ax.annotate(str(p.get_height()), 
+                (p.get_x() + p.get_width() / 2., p.get_height()),
+                ha='center', va='center', xytext=(0, 5), textcoords='offset points')
+
+plt.tight_layout()
+plt.show()
+
+def clean_data(df, text_column='text'):
+    """
+    Implement text cleaning:
+    - lowercase conversion
+    - remove punctuation, URLs, special characters
+    - remove stopwords
+    - lemmatization
+    - handle missing values
+    """
+    # Initialize lemmatizer and stopwords
+    lemmatizer = WordNetLemmatizer()
+    stop_words = set(stopwords.words('english'))
+    
+    def clean_text(text):
+        if not isinstance(text, str):
+            return ""
+        
+        # Convert to lowercase
+        text = text.lower()
+        
+        # Remove URLs
+        text = re.sub(r'http\S+|www\S+|https\S+', '', text, flags=re.MULTILINE)
+        
+        # Remove user @ references and '#' from hashtags
+        text = re.sub(r'\@\w+|\#', '', text)
+        
+        # Remove punctuation and special characters
+        text = re.sub(r'[^\w\s]', '', text)
+        
+        # Tokenize
+        word_tokens = word_tokenize(text)
+        
+        # Remove stopwords and lemmatize
+        filtered_text = [
+            lemmatizer.lemmatize(word) 
+            for word in word_tokens 
+            if word not in stop_words
+        ]
+        
+        return ' '.join(filtered_text)
+    
+    # Apply cleaning to text column
+    df_clean = df.copy()
+    df_clean[text_column] = df_clean[text_column].apply(clean_text)
+    
+    return df_clean
+
+def remove_outliers(df, text_column='text', min_len=5, max_len=200):
+    """
+    Identify and remove outlier texts based on length:
+    - Remove texts that are too short (less than min_len words)
+    - Remove texts that are too long (more than max_len words)
+    """
+    df_filtered = df.copy()
+    
+    # Calculate text lengths
+    text_lengths = df_filtered[text_column].str.split().str.len()
+    
+    # Filter by length
+    mask = (text_lengths >= min_len) & (text_lengths <= max_len)
+    df_filtered = df_filtered[mask]
+    
+    # Print info about removed outliers
+    num_removed = len(df) - len(df_filtered)
+    print(f"Removed {num_removed} outliers ({num_removed/len(df):.2%} of data)")
+    
+    return df_filtered.reset_index(drop=True)
+
+# Apply cleaning and filtering
+print("Cleaning and filtering data...")
+train = clean_data(train)
+train = remove_outliers(train)
+test = clean_data(test)
+
+# Text & labels
+text_column = 'text'
+target_column = 'label'
+
+X = train[text_column].tolist()
+y = train[target_column].tolist()
+X_test = test[text_column].tolist()
+
+# Encode labels
+label_encoder = LabelEncoder()
+y_encoded = label_encoder.fit_transform(y)
+num_classes = len(label_encoder.classes_)
+
+# Vocabulary builder with improved handling
+def build_vocab(texts, max_vocab_size=10000, min_freq=2):
+    """
+    Build vocabulary with frequency threshold
+    Args:
+        texts: list of text samples
+        max_vocab_size: maximum vocabulary size
+        min_freq: minimum frequency for a word to be included
+    """
+    counter = Counter()
+    for text in texts:
+        counter.update(text.split())
+    
+    # Filter by minimum frequency
+    filtered_words = [(word, count) for word, count in counter.items() if count >= min_freq]
+    
+    # Sort by frequency and take top words
+    most_common = sorted(filtered_words, key=lambda x: x[1], reverse=True)[:max_vocab_size - 2]
+    
+    vocab = {word: idx + 2 for idx, (word, _) in enumerate(most_common)}
+    vocab['<pad>'] = 0  # Padding token
+    vocab['<unk>'] = 1  # Unknown words token
+    
+    print(f"Vocabulary size: {len(vocab)}")
+    return vocab
+
+vocab = build_vocab(X)
+
+# Improved text encoder with better handling of edge cases
+def encode_text(texts, vocab, max_length=200):
+    """
+    Encode texts to fixed-length sequences with padding/truncation
+    Args:
+        texts: list of text samples
+        vocab: vocabulary dictionary
+        max_length: maximum sequence length
+    """
+    sequences = []
+    unk_token = vocab.get('<unk>', 1)
+    pad_token = vocab.get('<pad>', 0)
+    
+    for text in texts:
+        tokens = text.split()
+        seq = [vocab.get(tok, unk_token) for tok in tokens]
+        
+        # Truncate or pad sequence
+        if len(seq) < max_length:
+            seq += [pad_token] * (max_length - len(seq))
+        else:
+            seq = seq[:max_length]
+        
+        sequences.append(seq)
+    
+    return torch.tensor(sequences, dtype=torch.long)
+
+X_encoded = encode_text(X, vocab)
+X_test_encoded = encode_text(X_test, vocab)
+
+# Train/Validation split with stratification
+test_size = 0.2
+seed = 42
+X_train, X_val, y_train, y_val = train_test_split(
+    X_encoded,
+    y_encoded,
+    test_size=test_size,
+    random_state=seed,
+    stratify=y_encoded
+)
+
+# Convert to tensors with appropriate dtype
+y_train = torch.tensor(y_train, dtype=torch.long)
+y_val = torch.tensor(y_val, dtype=torch.long)
+
+# Enhanced Dataset class
+class TextDataset(Dataset):
+    def __init__(self, X, y=None):
+        self.X = X
+        self.y = y
+        
+    def __len__(self):
+        return len(self.X)
+    
+    def __getitem__(self, idx):
+        if self.y is not None:
+            return self.X[idx], self.y[idx]
+        return self.X[idx]
+    
+    def get_class_weights(self):
+        """Compute class weights for imbalanced datasets"""
+        if self.y is None:
+            return None
+            
+        class_counts = torch.bincount(self.y)
+        total_samples = len(self.y)
+        num_classes = len(class_counts)
+        
+        weights = total_samples / (num_classes * class_counts.float())
+        return weights
+
+# DataLoaders with pin_memory for GPU acceleration
+batch_size = 64
+num_workers = 2  # For parallel data loading
+
+train_loader = DataLoader(
+    TextDataset(X_train, y_train),
+    batch_size=batch_size,
+    shuffle=True,
+    num_workers=num_workers,
+    pin_memory=True
+)
+
+val_loader = DataLoader(
+    TextDataset(X_val, y_val),
+    batch_size=batch_size,
+    num_workers=num_workers,
+    pin_memory=True
+)
+
+test_loader = DataLoader(
+    TextDataset(X_test_encoded),
+    batch_size=batch_size,
+    num_workers=num_workers,
+    pin_memory=True
+)
+
+
+import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from sklearn.metrics import confusion_matrix
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+import torch.optim as optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from sklearn.metrics import confusion_matrix, classification_report, f1_score, accuracy_score
+import seaborn as sns
+import matplotlib.pyplot as plt
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+
+# Enhanced Model definition with more regularization
+class ImprovedModel(nn.Module):
+    def __init__(self, vocab_size, embed_dim, hidden_dim, output_dim, dropout_rate=0.4):
+        super(ImprovedModel, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=vocab['<pad>'])
+        
+        # Added embedding dropout
+        self.embed_dropout = nn.Dropout(dropout_rate/2)
+        
+        # Stacked BiLSTM with layer normalization
+        self.lstm = nn.LSTM(embed_dim, hidden_dim, 
+                           batch_first=True, 
+                           bidirectional=True, 
+                           num_layers=2,
+                           dropout=dropout_rate if 2 > 1 else 0)
+        
+        # Layer normalization for LSTM outputs
+        self.ln = nn.LayerNorm(hidden_dim * 2)
+        
+        # Attention mechanism
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1, bias=False)
+        )
+        
+        self.dropout = nn.Dropout(dropout_rate)
+        self.fc = nn.Linear(hidden_dim * 2, output_dim)
+        
+        # Weight initialization
+        self.init_weights()
+
+    def init_weights(self):
+        for name, param in self.named_parameters():
+            if 'weight' in name:
+                if 'embedding' in name:
+                    nn.init.uniform_(param, -0.1, 0.1)
+                elif 'lstm' in name:
+                    if 'weight_ih' in name:
+                        nn.init.xavier_uniform_(param)
+                    elif 'weight_hh' in name:
+                        nn.init.orthogonal_(param)
+                elif 'fc' in name or 'attention' in name:
+                    nn.init.xavier_uniform_(param)
+            elif 'bias' in name:
+                nn.init.constant_(param, 0.0)
+                # LSTM forget gate bias initialization
+                if 'lstm' in name:
+                    n = param.size(0)
+                    param.data[n//4:n//2].fill_(1.0)
+
+    def forward(self, x, lengths=None):
+        # Embedding layer
+        emb = self.embedding(x)
+        emb = self.embed_dropout(emb)
+        
+        # LSTM layer
+        if lengths is not None:
+            packed = pack_padded_sequence(emb, lengths.cpu(), batch_first=True, enforce_sorted=False)
+            packed_out, (hidden, cell) = self.lstm(packed)
+            lstm_out, _ = pad_packed_sequence(packed_out, batch_first=True)
+        else:
+            lstm_out, (hidden, cell) = self.lstm(emb)
+        
+        lstm_out = self.ln(lstm_out)
+        
+        # Attention mechanism
+        attention_scores = self.attention(lstm_out)
+        attention_weights = torch.softmax(attention_scores, dim=1)
+        context_vector = torch.sum(attention_weights * lstm_out, dim=1)
+        
+        # Classification
+        context_vector = self.dropout(context_vector)
+        out = self.fc(context_vector)
+        return out
+
+# Instantiate model with more conservative parameters
+vocab_size = len(vocab)
+embed_dim = 128  # Slightly larger embedding
+hidden_dim = 192  # Reduced hidden dim for better generalization
+num_classes = len(label_encoder.classes_)
+
+model = ImprovedModel(
+    vocab_size=vocab_size,
+    embed_dim=embed_dim,
+    hidden_dim=hidden_dim,
+    output_dim=num_classes,
+    dropout_rate=0.4  # Increased dropout
+).to(device)
+
+# Print model summary
+print(model)
+total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"Total trainable parameters: {total_params:,}")
+
+# Enhanced loss function with label smoothing
+class LabelSmoothingCrossEntropy(nn.Module):
+    def __init__(self, smoothing=0.1):
+        super(LabelSmoothingCrossEntropy, self).__init__()
+        self.smoothing = smoothing
+    
+    def forward(self, x, target):
+        log_probs = torch.nn.functional.log_softmax(x, dim=-1)
+        nll_loss = -log_probs.gather(dim=-1, index=target.unsqueeze(1))
+        nll_loss = nll_loss.squeeze(1)
+        smooth_loss = -log_probs.mean(dim=-1)
+        loss = (1.0 - self.smoothing) * nll_loss + self.smoothing * smooth_loss
+        return loss.mean()
+
+# Use class weights if imbalance > 2:1 ratio
+class_counts = torch.bincount(y_train)
+class_weights = (1. / class_counts) * len(y_train) / len(class_counts)
+if (class_counts.max() / class_counts.min()) > 2:
+    criterion = LabelSmoothingCrossEntropy(smoothing=0.1)
+    criterion.weight = class_weights.to(device)
+    print("Using weighted label smoothing loss")
+else:
+    criterion = LabelSmoothingCrossEntropy(smoothing=0.1)
+    print("Using standard label smoothing loss")
+
+# Optimizer with adaptive learning rate and weight decay
+optimizer = optim.AdamW(model.parameters(), 
+                       lr=1e-3, 
+                       weight_decay=1e-4,  # Increased weight decay
+                       eps=1e-8)
+
+# Learning rate scheduler with warmup
+def get_lr_scheduler(optimizer, warmup_epochs=2):
+    def lr_lambda(current_epoch):
+        if current_epoch < warmup_epochs:
+            return float(current_epoch) / float(max(1, warmup_epochs))
+        else:
+            return 0.95 ** (current_epoch - warmup_epochs)
+    return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+scheduler = get_lr_scheduler(optimizer)
+plateau_scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2, verbose=True)
+
+# Enhanced training loop with gradient accumulation
+epochs = 7
+best_val_f1 = 0
+patience = 4
+no_improve = 0
+grad_accum_steps = 2  # Gradient accumulation steps
+
+train_losses = []
+val_losses = []
+val_f1s = []
+val_accs = []
+
+for epoch in range(epochs):
+    model.train()
+    running_loss = 0.0
+    optimizer.zero_grad()
+    
+    for i, (inputs, targets) in enumerate(train_loader):
+        inputs, targets = inputs.to(device), targets.to(device)
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
+        loss = loss / grad_accum_steps  # Normalize loss
+        loss.backward()
+        
+        # Gradient accumulation
+        if (i + 1) % grad_accum_steps == 0 or (i + 1) == len(train_loader):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+        
+        running_loss += loss.item() * inputs.size(0) * grad_accum_steps
+    
+    # Update learning rate
+    scheduler.step()
+    
+    avg_train_loss = running_loss / len(train_loader.dataset)
+    train_losses.append(avg_train_loss)
+
+    # Validation
+    model.eval()
+    val_loss = 0.0
+    y_val_preds = []
+    y_val_true = []
+    
+    with torch.no_grad():
+        for inputs, targets in val_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            val_loss += loss.item() * inputs.size(0)
+            y_val_preds.extend(torch.argmax(outputs, dim=1).cpu().numpy())
+            y_val_true.extend(targets.cpu().numpy())
+
+    avg_val_loss = val_loss / len(val_loader.dataset)
+    val_losses.append(avg_val_loss)
+    
+    val_f1 = f1_score(y_val_true, y_val_preds, average='macro')
+    val_f1s.append(val_f1)
+    val_acc = accuracy_score(y_val_true, y_val_preds)
+    val_accs.append(val_acc)
+    
+    # Update plateau scheduler
+    plateau_scheduler.step(val_f1)
+    
+    print(f"Epoch {epoch+1}/{epochs} | "
+          f"Train Loss: {avg_train_loss:.4f} | "
+          f"Val Loss: {avg_val_loss:.4f} | "
+          f"Val F1: {val_f1:.4f} | "
+          f"Val Acc: {val_acc:.4f} | "
+          f"LR: {optimizer.param_groups[0]['lr']:.2e}")
+
+    # Early stopping with patience
+    if val_f1 > best_val_f1 + 0.001:  # Small threshold to prevent tiny improvements
+        best_val_f1 = val_f1
+        no_improve = 0
+        torch.save(model.state_dict(), 'best_model.pth')
+        print("New best model saved!")
+    else:
+        no_improve += 1
+        if no_improve >= patience:
+            print(f"No improvement for {patience} epochs, stopping early")
+            break
+
+# Load best model
+model.load_state_dict(torch.load('best_model.pth'))
+
+# Plot learning curves
+plt.figure(figsize=(15, 5))
+plt.subplot(1, 3, 1)
+plt.plot(train_losses, label='Train Loss')
+plt.plot(val_losses, label='Val Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+
+plt.subplot(1, 3, 2)
+plt.plot(val_f1s, label='Val F1')
+plt.xlabel('Epoch')
+plt.ylabel('F1 Score')
+plt.legend()
+
+plt.subplot(1, 3, 3)
+plt.plot(val_accs, label='Val Accuracy')
+plt.xlabel('Epoch')
+plt.ylabel('Accuracy')
+plt.legend()
+
+plt.tight_layout()
+plt.savefig('learning_curves.png')
+plt.show()
+
+# Detailed evaluation
+print("\nClassification Report:")
+print(classification_report(y_val_true, y_val_preds, target_names=label_encoder.classes_))
+
+# Confusion matrix
+cm = confusion_matrix(y_val_true, y_val_preds)
+plt.figure(figsize=(10, 8))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+            xticklabels=label_encoder.classes_, 
+            yticklabels=label_encoder.classes_)
+plt.title('Confusion Matrix')
+plt.xlabel('Predicted')
+plt.ylabel('True')
+plt.savefig('confusion_matrix.png')
+plt.show()
+
+# Test inference with TTA (Test Time Augmentation)
+def predict_with_tta(model, loader, n_augments=3):
+    model.eval()
+    all_preds = []
+    with torch.no_grad():
+        for inputs in loader:
+            inputs = inputs.to(device)
+            # Original prediction
+            outputs = model(inputs)
+            preds = torch.softmax(outputs, dim=1)
+            
+            # Add noise for augmentation
+            for _ in range(n_augments):
+                noisy_inputs = inputs + torch.randn_like(inputs) * 0.1  # Small noise
+                outputs = model(noisy_inputs)
+                preds += torch.softmax(outputs, dim=1)
+            
+            # Average predictions
+            preds = preds / (n_augments + 1)
+            all_preds.extend(torch.argmax(preds, dim=1).cpu().numpy())
+    return all_preds
+
+test_preds = predict_with_tta(model, test_loader)
+
+# Create submission
+submission = pd.DataFrame({'ID': test.index, 'label': label_encoder.inverse_transform(test_preds)})
+submission.to_csv('submission_pytorch_improved.csv', index=False)
+print("Submission file created: submission_pytorch_improved.csv")
